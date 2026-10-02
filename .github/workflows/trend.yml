@@ -1,0 +1,52 @@
+name: Daily Gaming Trend & Script Intelligence
+
+on:
+  schedule:
+    - cron: "0 12 * * *"   # 12:00 UTC = 8:00 AM EDT / 7:00 AM EST (GitHub may delay by several minutes)
+  workflow_dispatch:        # manual runs from the Actions tab
+    inputs:
+      mode:
+        description: "auto = news if versions can be fetched, else evergreen"
+        type: choice
+        options: [auto, news, evergreen]
+        default: auto
+      lane:
+        description: "creator = Shorts/TikTok concept, developer = buildable mechanic idea"
+        type: choice
+        options: [creator, developer]
+        default: creator
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trend-bot
+  cancel-in-progress: false
+
+jobs:
+  run-trend-bot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run trend bot
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WEBHOOK: ${{ secrets.WEBHOOK }}
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          # Manual-run inputs win; scheduled runs use repo variables (Settings > Variables), else defaults.
+          MODE: ${{ inputs.mode || vars.MODE }}
+          LANE: ${{ inputs.lane || vars.LANE }}
+          STRICT: ${{ vars.STRICT }}
+        run: python trend_bot.py
