@@ -1,0 +1,37 @@
+name: Daily Gaming Trend & Script Intelligence
+
+on:
+  schedule:
+    - cron: "0 12 * * *"   # 12:00 UTC = 8:00 AM EDT / 7:00 AM EST (GitHub may delay by several minutes)
+  workflow_dispatch:        # lets you run it manually from the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trend-bot
+  cancel-in-progress: false
+
+jobs:
+  run-trend-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run trend bot
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WEBHOOK: ${{ secrets.WEBHOOK }}
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+        run: python trend_bot.py
