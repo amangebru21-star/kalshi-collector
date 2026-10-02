@@ -1,67 +1,64 @@
 import os
-import pandas as pd
-import psycopg2
 import requests
+import psycopg2
 
-# Load configuration from environment variables
 DB_URL = os.environ.get("NEON_DATABASE_URL")
 if DB_URL:
     DB_URL = DB_URL.strip().strip('"').replace("&channel_binding=require", "")
-
-WEBHOOK = os.environ.get("WEBHOOK")
-LOOKBACK = "24 hours"
-MIN_SNAPS = 6
-MIN_ABS = 50
-Z = 3.0
 
 def main():
     if not DB_URL:
         raise ValueError("NEON_DATABASE_URL environment variable is missing.")
 
-    q = f"""
-    WITH d AS (
-        SELECT ticker, ts, yes_bid, yes_ask,
-               volume - LAG(volume) OVER (PARTITION BY ticker ORDER BY ts) AS dvol
-        FROM kalshi_book
-        WHERE ts > now() - interval '{LOOKBACK}'
-    )
-    SELECT d.ticker, m.title, d.ts, d.yes_bid, d.yes_ask, d.dvol
-    FROM d JOIN kalshi_markets m USING (ticker)
-    WHERE d.dvol IS NOT NULL
-    ORDER BY d.ticker, d.ts
-    """
+    # Fetch active markets and order book snapshots from Kalshi API
+    url = "https://api.elections.kalshi.com/trade-api/v2/markets?status=open&limit=1000"
+    resp = requests.get(url)
+    resp.raise_for_status()
+    markets = resp.json().get("markets", [])
 
-    with psycopg2.connect(DB_URL) as conn, conn.cursor() as cur:
-        cur.execute(q)
-        df = pd.DataFrame(cur.fetchall(), columns=[c[0] for c in cur.description])
-
-    if df.empty:
-        print("No market data found for the given lookback period.")
+    if not markets:
+        print("No open markets found from Kalshi API.")
         return
 
-    latest = df.ts.max()
-    alerts = []
-    for tkr, g in df.groupby("ticker"):
-        if len(g) < MIN_SNAPS:
-            continue
+    conn = psycopg2.connect(DB_URL)
+    cur = conn.cursor()
 
-        last = g.iloc[-1]
-        if last.ts < latest - pd.Timedelta(minutes=5):
-            continue  # stale: not in the newest collector run
+    # Ensure tables exist (adjust schema as per your setup)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS kalshi_markets (
+            ticker TEXT PRIMARY KEY,
+            title TEXT
+        );
+        CREATE TABLE IF NOT EXISTS kalshi_book (
+            ticker TEXT,
+            ts TIMESTAMP DEFAULT now(),
+            yes_bid INT,
+            yes_ask INT,
+            volume INT
+        );
+    """)
 
-        base = g.dvol.iloc[:-1]
-        thresh = max(MIN_ABS, base.mean() + Z * base.std(ddof=0))
-        if last.dvol >= thresh:
-            alerts.append(
-                f"🔥 {last.title[:60]}\n{tkr}\n+{last.dvol:.0f} vol "
-                f"(norm ~{base.mean():.0f}) | bid {last.yes_bid} / ask {last.yes_ask}"
-            )
+    for m in markets:
+        ticker = m.get("ticker")
+        title = m.get("title")
+        cur.execute(
+            "INSERT INTO kalshi_markets (ticker, title) VALUES (%s, %s) ON CONFLICT (ticker) DO UPDATE SET title = EXCLUDED.title;",
+            (ticker, title)
+        )
 
-    msg = "\n\n".join(alerts) or "No volume spikes."
-    print(msg)
+        yes_bid = m.get("yes_bid")
+        yes_ask = m.get("yes_ask")
+        volume = m.get("volume")
 
-    if alerts and WEBHOOK:
-        requests.post(WEBHOOK, json={"content": msg[:1900]})
+        cur.execute(
+            "INSERT INTO kalshi_book (ticker, yes_bid, yes_ask, volume) VALUES (%s, %s, %s, %s);",
+            (ticker, yes_bid, yes_ask, volume)
+        )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(f"Successfully collected data for {len(markets)} markets.")
 
 if __name__ == "__main__":
     main()
