@@ -188,13 +188,13 @@ def build_tools(mode: str) -> list[types.Tool] | None:
 
 def call_model(
     client: genai.Client, model: str, prompt: str, mode: str
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], str]:
     """One model, one tool config. Retries transient errors with backoff."""
     # Note: temperature/top_p/top_k are deprecated on current Gemini models, so
     # they are deliberately not set. The token cap is generous because thinking
     # tokens count against it.
     config = types.GenerateContentConfig(
-        max_output_tokens=2048,
+        max_output_tokens=8192,
         tools=build_tools(mode),
     )
     for attempt in range(1, 4):
@@ -205,7 +205,15 @@ def call_model(
             text = (response.text or "").strip()
             if not text:
                 raise RuntimeError("Gemini returned an empty response.")
-            return text, extract_sources(response)
+            finish = ""
+            try:
+                finish = str(response.candidates[0].finish_reason)
+            except (AttributeError, IndexError, TypeError):
+                pass
+            log.info("%s finished: %s (%d chars)", model, finish or "unknown", len(text))
+            if "MAX_TOKENS" in finish or "FACT-CHECK" not in text:
+                raise RuntimeError(f"Incomplete response (finish={finish or 'unknown'}).")
+            return text, extract_sources(response), f"{model} · tools: {mode}"
         except genai_errors.APIError as e:
             if e.code in RETRYABLE_CODES and attempt < 3:
                 delay = 2 ** attempt
@@ -221,7 +229,7 @@ def call_model(
     raise RuntimeError("unreachable")
 
 
-def generate_trend_intelligence(past_titles: list[str]) -> tuple[str, list[str]]:
+def generate_trend_intelligence(past_titles: list[str]) -> tuple[str, list[str], str]:
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable is missing.")
 
@@ -309,12 +317,13 @@ def sanitize(msg: str) -> str:
 def main() -> int:
     try:
         history = load_history()
-        content, sources = generate_trend_intelligence(history)
+        content, sources, meta = generate_trend_intelligence(history)
         message = "📈 **Automated Gaming Trend & Script Intelligence**\n\n" + content
         if sources:
             message += "\n\n🔗 **Sources**:\n" + "\n".join(f"<{u}>" for u in sources)
         else:
             message += "\n\n⚠️ _No sources returned — treat every claim as unverified._"
+        message += f"\n-# {meta}"
 
         print(message)
         post_discord(message)
