@@ -1,67 +1,67 @@
 import os
+import pandas as pd
 import psycopg2
 import requests
-from psycopg2.extras import execute_values
 
-DATABASE_URL = os.environ["NEON_DATABASE_URL"]
-URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
+# Load configuration from environment variables
+DB_URL = os.environ.get("NEON_DATABASE_URL")
+if DB_URL:
+    DB_URL = DB_URL.strip().strip('"').replace("&channel_binding=require", "")
 
+WEBHOOK = os.environ.get("WEBHOOK")
+LOOKBACK = "24 hours"
+MIN_SNAPS = 6
+MIN_ABS = 50
+Z = 3.0
 
-def cents(m, legacy, dollars):
-    v = m.get(legacy)
-    if v:
-        return int(v)
-    d = m.get(dollars)
-    return round(float(d) * 100) if d else 0
+def main():
+    if not DB_URL:
+        raise ValueError("NEON_DATABASE_URL environment variable is missing.")
 
-
-markets, cursor = [], None
-for _ in range(20):  # max 20 pages of 1000
-    params = {"status": "open", "limit": 1000, "mve_filter": "exclude"}
-    if cursor:
-        params["cursor"] = cursor
-    r = requests.get(URL, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    markets += data.get("markets", [])
-    cursor = data.get("cursor")
-    if not cursor:
-        break
-
-rows = []
-for m in markets:
-    ticker = m.get("ticker", "")
-    if ticker.startswith("KXMVE"):
-        continue
-    bid = cents(m, "yes_bid", "yes_bid_dollars")
-    ask = cents(m, "yes_ask", "yes_ask_dollars")
-    vol = int(m.get("volume") or float(m.get("volume_fp") or 0))
-    if bid == 0 or ask == 0:
-        continue
-    rows.append((ticker, m.get("title", ""), bid, ask, vol))
-
-if markets and not rows:
-    s = markets[0]
-    print("DEBUG sample:", {k: s.get(k) for k in
-          ["ticker", "yes_bid", "yes_bid_dollars", "yes_ask",
-           "yes_ask_dollars", "volume", "volume_fp"]})
-
-if rows:
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    execute_values(
-        cur,
-        "INSERT INTO kalshi_markets (ticker, title) VALUES %s "
-        "ON CONFLICT (ticker) DO NOTHING",
-        [(t, ti) for t, ti, _, _, _ in rows],
+    q = f"""
+    WITH d AS (
+        SELECT ticker, ts, yes_bid, yes_ask,
+               volume - LAG(volume) OVER (PARTITION BY ticker ORDER BY ts) AS dvol
+        FROM kalshi_book
+        WHERE ts > now() - interval '{LOOKBACK}'
     )
-    execute_values(
-        cur,
-        "INSERT INTO kalshi_book (ticker, yes_bid, yes_ask, volume) VALUES %s",
-        [(t, b, a, v) for t, _, b, a, v in rows],
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    SELECT d.ticker, m.title, d.ts, d.yes_bid, d.yes_ask, d.dvol
+    FROM d JOIN kalshi_markets m USING (ticker)
+    WHERE d.dvol IS NOT NULL
+    ORDER BY d.ticker, d.ts
+    """
 
-print(f"Saved {len(rows)} snapshots from {len(markets)} markets.")
+    with psycopg2.connect(DB_URL) as conn, conn.cursor() as cur:
+        cur.execute(q)
+        df = pd.DataFrame(cur.fetchall(), columns=[c[0] for c in cur.description])
+
+    if df.empty:
+        print("No market data found for the given lookback period.")
+        return
+
+    latest = df.ts.max()
+    alerts = []
+    for tkr, g in df.groupby("ticker"):
+        if len(g) < MIN_SNAPS:
+            continue
+
+        last = g.iloc[-1]
+        if last.ts < latest - pd.Timedelta(minutes=5):
+            continue  # stale: not in the newest collector run
+
+        base = g.dvol.iloc[:-1]
+        thresh = max(MIN_ABS, base.mean() + Z * base.std(ddof=0))
+        if last.dvol >= thresh:
+            alerts.append(
+                f"🔥 {last.title[:60]}\n{tkr}\n+{last.dvol:.0f} vol "
+                f"(norm ~{base.mean():.0f}) | bid {last.yes_bid} / ask {last.yes_ask}"
+            )
+
+    msg = "\n\n".join(alerts) or "No volume spikes."
+    print(msg)
+
+    if alerts and WEBHOOK:
+        requests.post(WEBHOOK, json={"content": msg[:1900]})
+
+if __name__ == "__main__":
+    main()
