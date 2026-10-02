@@ -13,6 +13,7 @@ Env vars:
     GEMINI_MODEL          comma-separated model fallback list
                           (default: gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite)
     USE_SEARCH            "1" (default) to ground in Google Search, "0" to disable
+    OFFICIAL_SOURCES      comma-separated official URLs to read first ("none" to disable)
 """
 
 import datetime as dt
@@ -43,6 +44,19 @@ MODELS = [
     if m.strip()
 ]
 USE_SEARCH = os.environ.get("USE_SEARCH", "1") == "1"
+
+# Official pages Gemini reads first (via the URL context tool). Override with a
+# comma-separated OFFICIAL_SOURCES env var; set it to "none" to disable.
+DEFAULT_SOURCES = (
+    "https://dev.epicgames.com/documentation/fortnite/whats-new-in-unreal-editor-for-fortnite,"
+    "https://create.roblox.com/docs/en-us/releases"
+)
+_raw_sources = os.environ.get("OFFICIAL_SOURCES", DEFAULT_SOURCES)
+OFFICIAL_SOURCES = (
+    []
+    if _raw_sources.strip().lower() == "none"
+    else [u.strip() for u in _raw_sources.split(",") if u.strip().startswith("http")]
+)
 
 DISCORD_LIMIT = 1900          # hard limit is 2000; leave headroom
 HISTORY_SIZE = 15             # past titles fed back into the prompt
@@ -105,15 +119,29 @@ def build_prompt(past_titles: list[str]) -> str:
             + "\n".join(f"- {t}" for t in past_titles)
             + "\n"
         )
+    official = ""
+    if OFFICIAL_SOURCES:
+        official = (
+            "\nFirst, read these official pages and find the NEWEST release/update listed:\n"
+            + "\n".join(f"- {u}" for u in OFFICIAL_SOURCES)
+            + "\nBuild the concept around a specific, real change from the latest release "
+            "notes (name the version number). Players and viewers care about what is new.\n"
+        )
     return f"""Today is {today}.
 {ACTIVE_FOCUS}
 
-Act as an elite short-form gaming content strategist. Check what is currently
-trending in these niches: recent official updates (Roblox developer announcements,
-Fortnite / UEFN release notes), plus what is performing on YouTube Shorts and TikTok.
-Then produce ONE original, specific video concept for Roblox or Fortnite. Avoid
-generic advice; name concrete games, mechanics, update features, or map types.
-{avoid}
+Act as an elite short-form gaming content strategist. Produce ONE original,
+specific video concept for Roblox or Fortnite, based on what is currently new and
+trending in these niches (official updates, plus what is performing on YouTube
+Shorts and TikTok). Avoid generic advice; name concrete games, mechanics, update
+features, or map types.
+{official}{avoid}
+Accuracy rules (important):
+- Never invent map/island codes, setting names, device names, or input combos.
+  Only state a mechanic as fact if a source you found supports it.
+- If the idea depends on something you could not confirm, say so in the fact-check line.
+- If you cannot find a real, current trend, pitch an evergreen idea and say it is evergreen.
+
 Use exactly this structure and nothing else (no intro, no outro):
 
 🎬 **TITLE / HOOK IDEA**: (catchy, high-CTR title + the first 3-second visual hook)
@@ -123,17 +151,51 @@ Use exactly this structure and nothing else (no intro, no outro):
 • [3-20s] Core Value / Action:
 • [20-30s] CTA & Loop:
 ⚡ **ESTIMATED EFFORT**: (Low / Medium / High production time, with one line why)
+🔍 **FACT-CHECK**: (what is confirmed by sources vs. what the creator must test in-game before posting)
 """
 
 
-def call_model(client: genai.Client, model: str, prompt: str, use_search: bool) -> str:
+def extract_sources(response) -> list[str]:
+    """Official pages actually read (URL context) first, then Search grounding links."""
+    urls: list[str] = []
+    try:
+        ucm = response.candidates[0].url_context_metadata
+        for item in (ucm.url_metadata or []):
+            status = str(getattr(item, "url_retrieval_status", ""))
+            if item.retrieved_url and "SUCCESS" in status and item.retrieved_url not in urls:
+                urls.append(item.retrieved_url)
+    except (AttributeError, IndexError, TypeError):
+        pass
+    try:
+        meta = response.candidates[0].grounding_metadata
+        for chunk in (meta.grounding_chunks or []):
+            web = getattr(chunk, "web", None)
+            if web and web.uri and web.uri not in urls:
+                urls.append(web.uri)
+    except (AttributeError, IndexError, TypeError):
+        pass
+    return urls[:6]
+
+
+def build_tools(mode: str) -> list[types.Tool] | None:
+    tools: list[types.Tool] = []
+    if mode in ("full", "urls") and OFFICIAL_SOURCES:
+        tools.append(types.Tool(url_context=types.UrlContext()))
+    if mode == "full":
+        tools.append(types.Tool(google_search=types.GoogleSearch()))
+    return tools or None
+
+
+def call_model(
+    client: genai.Client, model: str, prompt: str, mode: str
+) -> tuple[str, list[str]]:
     """One model, one tool config. Retries transient errors with backoff."""
     # Note: temperature/top_p/top_k are deprecated on current Gemini models, so
     # they are deliberately not set. The token cap is generous because thinking
     # tokens count against it.
     config = types.GenerateContentConfig(
         max_output_tokens=2048,
-        tools=[types.Tool(google_search=types.GoogleSearch())] if use_search else None,
+        tools=build_tools(mode),
     )
     for attempt in range(1, 4):
         try:
@@ -143,7 +205,7 @@ def call_model(client: genai.Client, model: str, prompt: str, use_search: bool) 
             text = (response.text or "").strip()
             if not text:
                 raise RuntimeError("Gemini returned an empty response.")
-            return text
+            return text, extract_sources(response)
         except genai_errors.APIError as e:
             if e.code in RETRYABLE_CODES and attempt < 3:
                 delay = 2 ** attempt
@@ -159,23 +221,24 @@ def call_model(client: genai.Client, model: str, prompt: str, use_search: bool) 
     raise RuntimeError("unreachable")
 
 
-def generate_trend_intelligence(past_titles: list[str]) -> str:
+def generate_trend_intelligence(past_titles: list[str]) -> tuple[str, list[str]]:
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable is missing.")
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = build_prompt(past_titles)
-    search_modes = [True, False] if USE_SEARCH else [False]
+    # Degrade gracefully: official pages + Search -> official pages only -> no tools.
+    modes = ["full", "urls", "none"] if USE_SEARCH else ["urls", "none"]
     last_error: Exception | None = None
 
     for model in MODELS:
-        for use_search in search_modes:
+        for mode in modes:
             try:
-                log.info("Generating with %s (search=%s)", model, use_search)
-                return call_model(client, model, prompt, use_search)
+                log.info("Generating with %s (tools=%s)", model, mode)
+                return call_model(client, model, prompt, mode)
             except (genai_errors.APIError, RuntimeError) as e:
                 last_error = e
-                log.warning("%s failed (search=%s): %s", model, use_search, str(e)[:200])
+                log.warning("%s failed (tools=%s): %s", model, mode, str(e)[:200])
 
     raise RuntimeError(f"All models failed ({', '.join(MODELS)}). Last error: {last_error}")
 
@@ -246,8 +309,12 @@ def sanitize(msg: str) -> str:
 def main() -> int:
     try:
         history = load_history()
-        content = generate_trend_intelligence(history)
+        content, sources = generate_trend_intelligence(history)
         message = "📈 **Automated Gaming Trend & Script Intelligence**\n\n" + content
+        if sources:
+            message += "\n\n🔗 **Sources**:\n" + "\n".join(f"<{u}>" for u in sources)
+        else:
+            message += "\n\n⚠️ _No sources returned — treat every claim as unverified._"
 
         print(message)
         post_discord(message)
