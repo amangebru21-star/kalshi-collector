@@ -122,13 +122,17 @@ def find_alerts(df, cooled):
 
         mult = last["vph"] / max(mean, 1.0)
         dmid = 0.0 if pd.isna(last["dmid"]) else float(last["dmid"])
-        arrow = "▲" if dmid > 0 else "▼" if dmid < 0 else "▬"
+        direction = (
+            "🟢 Bullish Pressure" if dmid > 0
+            else "🔴 Bearish Pressure" if dmid < 0
+            else "⚖️ Neutral Shift"
+        )
         msg = (
-            f"🔥 {str(last['title'])[:60]}\n{tkr}\n"
-            f"{arrow} mid {mid:.1f}¢ ({dmid:+.1f}) | bid {int(last['yes_bid'])} / "
-            f"ask {int(last['yes_ask'])} (spread {int(spread)})\n"
-            f"{last['vph']:.0f}/hr vs norm {mean:.0f}/hr ({mult:.1f}x) | "
-            f"+{int(last['dvol'])} contracts"
+            f"🔥 **{str(last['title'])[:60]}**\n"
+            f"`{tkr}` | **+{int(last['dvol'])} vol** "
+            f"({last['vph']:.0f}/hr vs norm {mean:.0f}/hr, {mult:.1f}x)\n"
+            f"Price: {mid:.1f}¢ ({dmid:+.1f}) | bid {int(last['yes_bid'])} / "
+            f"ask {int(last['yes_ask'])} | Spread: {int(spread)}¢ | {direction}"
         )
         out.append(dict(
             ticker=tkr, dvol=int(last["dvol"]), mid=float(mid),
