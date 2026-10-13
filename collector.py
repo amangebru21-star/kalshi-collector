@@ -1,9 +1,11 @@
 import os
 import time
-
-import psycopg2
+import logging
 import requests
-from psycopg2.extras import execute_values
+import storage
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("collector")
 
 DB_URL = (
     os.environ.get("NEON_DATABASE_URL", "")
@@ -12,18 +14,7 @@ DB_URL = (
     .replace("&channel_binding=require", "")
 )
 URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
-RETENTION_DAYS = 14
 MAX_PAGES = 20  # 1000 markets per page
-
-
-def cents(m, legacy, dollars):
-    """Kalshi returns prices as legacy int cents and/or '0.5600' dollar strings."""
-    v = m.get(legacy)
-    if v:
-        return int(v)
-    d = m.get(dollars)
-    return round(float(d) * 100) if d else 0
-
 
 def fetch_markets():
     markets, cursor = [], None
@@ -50,55 +41,42 @@ def fetch_markets():
         time.sleep(0.25)
     return markets
 
-
 def main():
     if not DB_URL:
         raise ValueError("NEON_DATABASE_URL environment variable is missing.")
 
-    markets = fetch_markets()
+    log.info("Connecting to database using lean storage module...")
+    conn = storage.connect(DB_URL)
+    
+    try:
+        # Ensure schema tables and partitions exist
+        storage.init_schema(conn)
+        log.info("Database schema verified.")
 
-    # one row per ticker, quoted markets only
-    rows = {}
-    for m in markets:
-        ticker = m.get("ticker", "")
-        if not ticker or ticker.startswith("KXMVE"):
-            continue
-        bid = cents(m, "yes_bid", "yes_bid_dollars")
-        ask = cents(m, "yes_ask", "yes_ask_dollars")
-        if bid == 0 or ask == 0:
-            continue
-        vol = int(float(m.get("volume") or m.get("volume_fp") or 0))
-        rows[ticker] = (ticker, m.get("title", ""), bid, ask, vol)
-    rows = list(rows.values())
+        markets = fetch_markets()
+        log.info(f"Fetched {len(markets)} markets from Kalshi API.")
 
-    if markets and not rows:
-        s = markets[0]
-        print("DEBUG sample:", {k: s.get(k) for k in [
-            "ticker", "yes_bid", "yes_bid_dollars", "yes_ask",
-            "yes_ask_dollars", "volume", "volume_fp"]})
+        # Filter out multivariate or empty tickers
+        usable_markets = [m for m in markets if m.get("ticker") and not m.get("ticker", "").startswith("KXMVE")]
 
-    with psycopg2.connect(DB_URL) as conn, conn.cursor() as cur:
-        if rows:
-            execute_values(
-                cur,
-                "INSERT INTO kalshi_markets (ticker, title) VALUES %s "
-                "ON CONFLICT (ticker) DO UPDATE SET title = EXCLUDED.title",
-                [(t, ti) for t, ti, _, _, _ in rows],
-            )
-            execute_values(
-                cur,
-                "INSERT INTO kalshi_book (ticker, yes_bid, yes_ask, volume) VALUES %s",
-                [(t, b, a, v) for t, _, b, a, v in rows],
-            )
-        # storage maintenance
-        cur.execute(
-            "DELETE FROM kalshi_book WHERE ts < now() - make_interval(days => %s)",
-            (RETENTION_DAYS,),
-        )
-        purged = cur.rowcount
+        if usable_markets:
+            # save_snapshot handles metadata upserts, change-driven ticks, and deduplication!
+            stats = storage.save_snapshot(conn, usable_markets)
+            log.info(f"Snapshot saved successfully: {stats}")
 
-    print(f"Saved {len(rows)} snapshots from {len(markets)} markets; purged {purged} old rows.")
+        # Run storage maintenance (rollups, anchors, partition drops) if due
+        m_stats = storage.maintain_if_due(conn)
+        if m_stats:
+            log.info(f"Maintenance performed: {m_stats}")
+        else:
+            log.info("Maintenance not due yet.")
 
+    except Exception as e:
+        log.error(f"Collector run failed: {e}")
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     main()
